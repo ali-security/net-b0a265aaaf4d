@@ -1,0 +1,113 @@
+name: seal-build
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Go package pattern(s) / -run selector to test; empty runs the full suite'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    name: build-and-test (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+      - name: Go version
+        run: go version && go env
+      - name: Create module zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Pack from a copy of the tree without this sealing workflow, so the
+          # module zip keeps the public member set.
+          SRC="$RUNNER_TEMP/modsrc"
+          cp -a "$GITHUB_WORKSPACE" "$SRC"
+          rm -rf "$SRC/.git"
+          # Upstream ships no .github directory; this workflow is its only file.
+          rm -rf "$SRC/.github"
+          HELPER="$RUNNER_TEMP/modhelper"
+          mkdir -p "$HELPER"
+          cat > "$HELPER/main.go" <<'EOF'
+          package main
+
+          import (
+                  "log"
+                  "os"
+
+                  "golang.org/x/mod/module"
+                  "golang.org/x/mod/zip"
+          )
+
+          func main() {
+                  m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+                  f, err := os.Create(os.Args[4])
+                  if err != nil {
+                      log.Fatal(err)
+                  }
+                  defer f.Close()
+                  if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                      log.Fatal(err)
+                  }
+                  log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          mkdir -p "$RUNNER_TEMP/out"
+          cd "$HELPER"
+          go mod init modhelper
+          go get golang.org/x/mod@v0.27.0
+          go run . golang.org/x/net v0.45.0 "$SRC" "$RUNNER_TEMP/out/v0.45.0.zip"
+          unzip -l "$RUNNER_TEMP/out/v0.45.0.zip" | tail -3
+      - name: Build
+        run: go build ./...
+      - name: Test
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -v -count=1 ${{ inputs.test-filter || './...' }} 2>&1 | tee "$RUNNER_TEMP/test.log"
+      - name: Test summary
+        if: always()
+        shell: bash
+        run: |
+          LOG="$RUNNER_TEMP/test.log"
+          if [ -f "$LOG" ]; then
+            awk '
+              /^[[:space:]]*--- PASS/ {p++}
+              /^[[:space:]]*--- FAIL/ {f++}
+              /^[[:space:]]*--- SKIP/ {s++}
+              /^ok[[:space:]]/ {ok++}
+              /^FAIL[[:space:]]/ {pf++}
+              /^\?[[:space:]]/ {nt++}
+              END {
+                printf "Passed tests:  %d\nFailed tests:  %d\nSkipped tests: %d\n", p, f, s
+                printf "Packages ok: %d, packages FAIL: %d, packages without test files: %d\n", ok, pf, nt
+              }' "$LOG"
+            echo "=== Skipped tests with reasons ==="
+            # go test -v logs a skip's t.Skip message right after the test's
+            # "=== RUN/NAME/CONT <test>" header, before its "--- SKIP" line;
+            # collect those messages per test and print them with each skip.
+            awk '
+              /^=== (RUN|NAME|CONT)[[:space:]]/ {cur=$3; next}
+              /^(ok|FAIL)[[:space:]]/ {split("", msg); next}
+              /^[[:space:]]*--- SKIP: / {
+                name=$3
+                r=msg[name]; if (r == "") r=" (no message logged)"
+                printf "SKIP %s -- reason:%s\n", name, r
+                next
+              }
+              /^[[:space:]]*--- / {next}
+              /^[[:space:]]+[^[:space:]]+\.go:[0-9]+: / {
+                line=$0; sub(/^[[:space:]]+/, "", line)
+                msg[cur]=msg[cur] " " line
+              }' "$LOG"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.45.0.zip
+          if-no-files-found: error
