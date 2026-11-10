@@ -497,6 +497,26 @@ func TestSearchTagClosesP(t *testing.T) {
 	}
 }
 
+func TestParseDuplicateAttributes(t *testing.T) {
+	// Browsers keep only the first occurrence of an attribute name (compared
+	// ASCII case-insensitively) and drop later duplicates. The parsed tree, and
+	// therefore the rendered output, must not carry the dropped duplicates.
+	data := `<a href="https://example.com/" HREF="javascript:alert(1)" href="javascript:alert(2)">x</a>`
+	node, err := Parse(strings.NewReader(data))
+	if err != nil {
+		t.Fatalf("Error parsing HTML: %v", err)
+	}
+
+	var builder strings.Builder
+	Render(&builder, node)
+	output := builder.String()
+
+	expected := `<html><head></head><body><a href="https://example.com/">x</a></body></html>`
+	if output != expected {
+		t.Errorf("Parse(%q) = %q, want %q", data, output, expected)
+	}
+}
+
 func BenchmarkParser(b *testing.B) {
 	buf, err := os.ReadFile("testdata/go1.html")
 	if err != nil {
